@@ -143,6 +143,11 @@ _EXTRA_ENV_KEYS = frozenset({
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
     "LANGFUSE_BASE_URL",
+    # Brio relay connector (`hermes brio`) — managed by the enroll/recover
+    # flows in hermes_cli/brio.py, not the setup wizard.
+    "BRIO_RELAY_URL",
+    "BRIO_RELAY_TOKEN",
+    "BRIO_AGENT_ID",
 })
 import yaml
 

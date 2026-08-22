@@ -118,6 +118,7 @@ class Platform(Enum):
     SMS = "sms"
     DINGTALK = "dingtalk"
     API_SERVER = "api_server"
+    BRIO = "brio"
     WEBHOOK = "webhook"
     MSGRAPH_WEBHOOK = "msgraph_webhook"
     FEISHU = "feishu"
@@ -423,6 +424,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.EMAIL: lambda cfg: bool(cfg.extra.get("address")),
     Platform.SMS: lambda cfg: bool(os.getenv("TWILIO_ACCOUNT_SID")),
     Platform.API_SERVER: lambda cfg: True,
+    Platform.BRIO: lambda cfg: bool(
+        cfg.extra.get("relay_url") and cfg.extra.get("relay_token") and cfg.extra.get("agent_id")
+    ),
     Platform.WEBHOOK: lambda cfg: True,
     Platform.MSGRAPH_WEBHOOK: lambda cfg: True,
     Platform.FEISHU: lambda cfg: bool(cfg.extra.get("app_id")),
@@ -1477,6 +1481,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
+
+    # Brio relay tunnel connector (written by `hermes brio enroll`)
+    brio_relay_url = os.getenv("BRIO_RELAY_URL", "").strip()
+    brio_relay_token = os.getenv("BRIO_RELAY_TOKEN", "").strip()
+    brio_agent_id = os.getenv("BRIO_AGENT_ID", "").strip()
+    if brio_relay_url and brio_relay_token and brio_agent_id:
+        if Platform.BRIO not in config.platforms:
+            config.platforms[Platform.BRIO] = PlatformConfig()
+        config.platforms[Platform.BRIO].enabled = True
+        config.platforms[Platform.BRIO].extra["relay_url"] = brio_relay_url
+        config.platforms[Platform.BRIO].extra["relay_token"] = brio_relay_token
+        config.platforms[Platform.BRIO].extra["agent_id"] = brio_agent_id
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in {"true", "1", "yes"}

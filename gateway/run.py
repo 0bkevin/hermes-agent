@@ -6046,6 +6046,13 @@ class GatewayRunner:
                 return None
             return APIServerAdapter(config)
 
+        elif platform == Platform.BRIO:
+            from gateway.platforms.brio_connector import BrioAdapter, check_brio_requirements
+            if not check_brio_requirements():
+                logger.warning("Brio: aiohttp not installed")
+                return None
+            return BrioAdapter(config)
+
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
             if not check_webhook_requirements():

@@ -13,6 +13,10 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- GET  /v1/sessions                 — list recent sessions (Brio-compatible)
+- GET  /v1/sessions/{id}/messages   — messages for one session (Brio-compatible)
+- GET  /v1/memory                   — read MEMORY.md / USER.md (Brio-compatible)
+- PUT  /v1/memory                   — write MEMORY.md / USER.md (Brio-compatible)
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -30,6 +34,7 @@ import hmac
 import json
 import logging
 import os
+from pathlib import Path
 import socket as _socket
 import re
 import sqlite3
@@ -578,6 +583,35 @@ class _IdempotencyCache:
 
 
 _idem_cache = _IdempotencyCache()
+
+
+def _atomic_write_private(path: Any, content: str) -> None:
+    """Atomically write ``content`` to ``path`` with 0600 permissions.
+
+    Mirrors the Brio companion's atomicWrite(): create a temp file in the
+    target directory, chmod it owner-only, write + fsync, then rename over
+    the target.  POSIX modes are not enforced on Windows, where the chmod
+    is a no-op (see AGENTS.md cross-platform rules).
+    """
+    import sys as _sys
+    import tempfile as _tempfile
+
+    path = Path(path)
+    fd, tmp_path = _tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + "-", suffix=".tmp")
+    try:
+        if _sys.platform != "win32":
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
@@ -2404,6 +2438,198 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     # ------------------------------------------------------------------
+    # Sessions / memory API (Brio mobile app)
+    # ------------------------------------------------------------------
+    #
+    # These endpoints back the Brio mobile app's session browser and memory
+    # editor.  The JSON shapes mirror brio's companion handlers
+    # (apps/companion/internal/server/server.go: sessions / sessionMessages /
+    # memory / updateMemory) exactly — including epoch-second timestamps and
+    # error-handling that returns HTTP 200 with an "error" key — so the app
+    # can switch from the companion binary to the API server without changes.
+
+    _SESSIONS_DEFAULT_LIMIT = 30
+    _SESSIONS_MIN_LIMIT = 1
+    _SESSIONS_MAX_LIMIT = 200
+    _MEMORY_MAX_BYTES = 1_000_000  # 1 MB per memory file, matching the companion
+
+    @staticmethod
+    def _query_int(request: "web.Request", key: str, default: int, lo: int, hi: int) -> int:
+        """Clamp an integer query param, mirroring the companion's queryInt()."""
+        raw = request.query.get(key, "")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return max(lo, min(hi, value))
+
+    def _open_session_db(self):
+        """Return a fresh SessionDB, or None when the state store is unavailable.
+
+        A dedicated short-lived connection is opened per request (matching the
+        companion's openStateDB-per-handler behavior) so the handler fully
+        controls the lifetime; the dashboard's SessionDB reuse pattern is not
+        thread-safe across aiohttp request tasks.
+        """
+        try:
+            from hermes_state import SessionDB
+            return SessionDB()
+        except Exception as e:
+            logger.warning("SessionDB unavailable for /v1/sessions: %s", e)
+            return None
+
+    async def _handle_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions?limit=N — list recent sessions.
+
+        Response shape (companion-compatible):
+        ``{"sessions": [{"id", "source", "user_id", "model", "started_at",
+        "ended_at", "message_count", "title"}, ...]}``
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        limit = self._query_int(
+            request, "limit", self._SESSIONS_DEFAULT_LIMIT,
+            self._SESSIONS_MIN_LIMIT, self._SESSIONS_MAX_LIMIT,
+        )
+        db = self._open_session_db()
+        if db is None:
+            return web.json_response({"sessions": [], "error": "session store unavailable"})
+        try:
+            sessions = db.list_sessions_rich(limit=limit)
+            items = [
+                {
+                    "id": s.get("id", ""),
+                    "source": s.get("source", ""),
+                    "user_id": s.get("user_id") or "",
+                    "model": s.get("model") or "",
+                    "started_at": s.get("started_at", 0.0),
+                    "ended_at": s.get("ended_at"),
+                    "message_count": s.get("message_count", 0),
+                    "title": s.get("title") or "",
+                }
+                for s in sessions
+            ]
+            return web.json_response({"sessions": items})
+        except Exception as e:
+            # Companion returns 200 with an empty list + error on DB failure.
+            return web.json_response({"sessions": [], "error": str(e)})
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id}/messages — messages for one session.
+
+        Response shape (companion-compatible):
+        ``{"messages": [{"role", "content", "tool_name", "timestamp"}, ...]}``
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        db = self._open_session_db()
+        if db is None:
+            return web.json_response({"messages": [], "error": "session store unavailable"})
+        try:
+            resolved = db.resolve_session_id(session_id) if session_id else None
+            if not resolved:
+                return web.json_response({"messages": [], "error": "session not found"})
+            messages = db.get_messages(resolved)
+            items = [
+                {
+                    "role": m.get("role", ""),
+                    "content": m.get("content") or "",
+                    "tool_name": m.get("tool_name") or "",
+                    "timestamp": m.get("timestamp", 0.0),
+                }
+                for m in messages
+            ]
+            return web.json_response({"messages": items})
+        except Exception as e:
+            return web.json_response({"messages": [], "error": str(e)})
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _memory_dir() -> "Any":
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "memories"
+
+    @staticmethod
+    def _read_memory_file(path: "Any") -> str:
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+        except OSError:
+            return ""
+
+    async def _handle_get_memory(self, request: "web.Request") -> "web.Response":
+        """GET /v1/memory — read MEMORY.md and USER.md.
+
+        Response shape (companion-compatible): ``{"memory": "...", "user": "..."}``
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        memory_dir = self._memory_dir()
+        memory = self._read_memory_file(memory_dir / "MEMORY.md")
+        user = self._read_memory_file(memory_dir / "USER.md")
+        return web.json_response({"memory": memory, "user": user})
+
+    async def _handle_update_memory(self, request: "web.Request") -> "web.Response":
+        """PUT /v1/memory — atomically write MEMORY.md and/or USER.md (0600).
+
+        Accepts ``{"memory"?: str, "user"?: str}``; only provided keys are
+        written.  Response shape (companion-compatible): ``{"ok": true}``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+
+        updates: Dict[str, str] = {}
+        for key, filename in (("memory", "MEMORY.md"), ("user", "USER.md")):
+            if key in body:
+                value = body.get(key)
+                if value is None:
+                    value = ""
+                if not isinstance(value, str):
+                    return web.json_response({"error": f"{key} must be a string"}, status=400)
+                if len(value.encode("utf-8")) > self._MEMORY_MAX_BYTES:
+                    return web.json_response(
+                        {"error": f"{key} is larger than 1 MiB"}, status=400,
+                    )
+                updates[filename] = value
+
+        if not updates:
+            return web.json_response({"error": "no fields to update"}, status=400)
+
+        memory_dir = self._memory_dir()
+        try:
+            memory_dir.mkdir(parents=True, exist_ok=True)
+            for filename, content in updates.items():
+                _atomic_write_private(memory_dir / filename, content)
+        except OSError as e:
+            return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"ok": True})
+
+    # ------------------------------------------------------------------
     # Cron jobs API
     # ------------------------------------------------------------------
 
@@ -3406,6 +3632,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            # Sessions + memory (Brio mobile app; companion-compatible shapes)
+            self._app.router.add_get("/v1/sessions", self._handle_sessions)
+            self._app.router.add_get("/v1/sessions/{session_id}/messages", self._handle_session_messages)
+            self._app.router.add_get("/v1/memory", self._handle_get_memory)
+            self._app.router.add_put("/v1/memory", self._handle_update_memory)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
